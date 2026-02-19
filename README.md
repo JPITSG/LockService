@@ -20,7 +20,11 @@ The service automatically tracks user sessions — attaching helpers when users 
 
 ### Using the GUI
 
-Double-click `LockService.exe` (as Administrator). A configuration dialog will appear with Install, Uninstall, Start, and Stop buttons. Buttons are grayed out based on the current service state.
+Double-click `LockService.exe` (as Administrator). A configuration dialog will appear with:
+
+- **Bind IP / Bind Port** fields to configure what address and port the HTTP server listens on (defaults: `0.0.0.0` / `8888`). Changes are saved to the registry and take effect on the next service start. If the service is already running, saving will automatically restart it.
+- **Install**, **Uninstall**, **Restart**, **Start**, and **Stop** buttons (grayed out based on current service state).
+- Colored status indicator — green when running, red when stopped.
 
 If launched without admin privileges, a warning dialog will prompt you to re-run as Administrator.
 
@@ -38,9 +42,20 @@ sc start LockService
 sc stop LockService
 ```
 
+## Configuration
+
+Settings are stored in the registry at `HKLM\SOFTWARE\JPIT\LockService`:
+
+| Value      | Type      | Default   | Description                        |
+|------------|-----------|-----------|------------------------------------|
+| `BindIP`   | REG_SZ    | `0.0.0.0` | IP address the HTTP server binds to |
+| `BindPort` | REG_DWORD | `8888`    | Port the HTTP server listens on     |
+
+These can be edited through the GUI dialog or directly in the registry for headless/scripted setups.
+
 ## HTTP API
 
-With the service running, a single endpoint is available:
+With the service running, a single endpoint is available (port is configurable, default `8888`):
 
 ```
 GET http://localhost:8888/lock
