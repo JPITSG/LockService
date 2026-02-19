@@ -909,6 +909,10 @@ static BOOL install_service(void) {
         goto cleanup;
     }
     
+    SERVICE_DESCRIPTIONW desc;
+    desc.lpDescription = L"Locks workstations and turns off monitors via HTTP API and Win+L hotkey interception.";
+    ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
+
     printf("Service installed successfully\n");
     printf("Service will start automatically on boot\n");
     printf("To start now: sc start %s\n", SERVICE_NAME);
