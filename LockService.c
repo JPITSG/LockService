@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <shlobj.h>
 
 #define SERVICE_NAME "LockService"
 #define SERVICE_DISPLAY_NAME_W L"Lock Screen Service"
@@ -24,6 +25,13 @@
 
 // Virtual key code for 'L' key
 #define VK_KEY_L 0x4C
+
+// Dialog control IDs
+#define IDC_STATUS_LABEL 101
+#define IDC_BTN_INSTALL  102
+#define IDC_BTN_UNINSTALL 103
+#define IDC_BTN_START    104
+#define IDC_BTN_STOP     105
 
 // Global service status handle
 static SERVICE_STATUS g_ServiceStatus;
@@ -947,6 +955,250 @@ cleanup:
     return bResult;
 }
 
+// Start the service via SCM
+static BOOL start_service(void) {
+    SC_HANDLE scm = NULL, svc = NULL;
+    BOOL bResult = FALSE;
+
+    scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!scm) return FALSE;
+
+    svc = OpenServiceW(scm, L"LockService", SERVICE_START);
+    if (!svc) goto cleanup;
+
+    bResult = StartServiceW(svc, 0, NULL);
+
+cleanup:
+    if (svc) CloseServiceHandle(svc);
+    if (scm) CloseServiceHandle(scm);
+    return bResult;
+}
+
+// Stop the service via SCM
+static BOOL stop_service(void) {
+    SC_HANDLE scm = NULL, svc = NULL;
+    SERVICE_STATUS status;
+    BOOL bResult = FALSE;
+
+    scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!scm) return FALSE;
+
+    svc = OpenServiceW(scm, L"LockService", SERVICE_STOP);
+    if (!svc) goto cleanup;
+
+    bResult = ControlService(svc, SERVICE_CONTROL_STOP, &status);
+
+cleanup:
+    if (svc) CloseServiceHandle(svc);
+    if (scm) CloseServiceHandle(scm);
+    return bResult;
+}
+
+// Helper to add a control to dialog template
+static BYTE* AddDialogControl(BYTE* ptr, WORD ctrlId, WORD classAtom, DWORD style,
+                               short posX, short posY, short width, short height,
+                               const wchar_t* text) {
+    // Align to DWORD
+    ptr = (BYTE*)(((ULONG_PTR)ptr + 3) & ~3);
+
+    DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)ptr;
+    item->style = style;
+    item->dwExtendedStyle = 0;
+    item->x = posX;
+    item->y = posY;
+    item->cx = width;
+    item->cy = height;
+    item->id = ctrlId;
+    ptr += sizeof(DLGITEMTEMPLATE);
+
+    // Class (atom)
+    *(WORD*)ptr = 0xFFFF;
+    ptr += sizeof(WORD);
+    *(WORD*)ptr = classAtom;
+    ptr += sizeof(WORD);
+
+    // Text
+    size_t textLen = wcslen(text) + 1;
+    memcpy(ptr, text, textLen * sizeof(wchar_t));
+    ptr += textLen * sizeof(wchar_t);
+
+    // Creation data (none)
+    *(WORD*)ptr = 0;
+    ptr += sizeof(WORD);
+
+    return ptr;
+}
+
+// Query service state: 0=not installed, 1=stopped, 2=running, 3=transitioning
+static int query_service_state(void) {
+    SC_HANDLE scm = NULL, svc = NULL;
+    SERVICE_STATUS status;
+    int result = 0;
+
+    scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!scm) return 0;
+
+    svc = OpenServiceW(scm, L"LockService", SERVICE_QUERY_STATUS);
+    if (!svc) {
+        CloseServiceHandle(scm);
+        return 0;
+    }
+
+    if (QueryServiceStatus(svc, &status)) {
+        switch (status.dwCurrentState) {
+            case SERVICE_STOPPED:
+                result = 1;
+                break;
+            case SERVICE_RUNNING:
+                result = 2;
+                break;
+            default:
+                result = 3;
+                break;
+        }
+    }
+
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return result;
+}
+
+// Update button enable states based on current service state
+static void RefreshButtonStates(HWND hDlg) {
+    int state = query_service_state();
+    const wchar_t* statusText;
+
+    switch (state) {
+        case 0: statusText = L"Status: Not Installed"; break;
+        case 1: statusText = L"Status: Installed (Stopped)"; break;
+        case 2: statusText = L"Status: Installed (Running)"; break;
+        case 3: statusText = L"Status: Installed (Transitioning...)"; break;
+        default: statusText = L"Status: Unknown"; break;
+    }
+
+    SetDlgItemTextW(hDlg, IDC_STATUS_LABEL, statusText);
+
+    BOOL installed = (state > 0);
+    EnableWindow(GetDlgItem(hDlg, IDC_BTN_INSTALL),   !installed);
+    EnableWindow(GetDlgItem(hDlg, IDC_BTN_UNINSTALL),  installed);
+    EnableWindow(GetDlgItem(hDlg, IDC_BTN_START),      installed && state == 1);
+    EnableWindow(GetDlgItem(hDlg, IDC_BTN_STOP),       installed && state == 2);
+}
+
+// Configuration dialog procedure
+static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_INITDIALOG:
+            RefreshButtonStates(hDlg);
+            return TRUE;
+
+        case WM_COMMAND:
+            switch (LOWORD(wParam)) {
+                case IDC_BTN_INSTALL:
+                    if (!install_service())
+                        MessageBoxW(hDlg, L"Failed to install service.", L"Error", MB_ICONERROR);
+                    RefreshButtonStates(hDlg);
+                    return TRUE;
+
+                case IDC_BTN_UNINSTALL:
+                    if (!uninstall_service())
+                        MessageBoxW(hDlg, L"Failed to uninstall service.", L"Error", MB_ICONERROR);
+                    RefreshButtonStates(hDlg);
+                    return TRUE;
+
+                case IDC_BTN_START:
+                    if (!start_service())
+                        MessageBoxW(hDlg, L"Failed to start service.", L"Error", MB_ICONERROR);
+                    Sleep(500);
+                    RefreshButtonStates(hDlg);
+                    return TRUE;
+
+                case IDC_BTN_STOP:
+                    if (!stop_service())
+                        MessageBoxW(hDlg, L"Failed to stop service.", L"Error", MB_ICONERROR);
+                    Sleep(500);
+                    RefreshButtonStates(hDlg);
+                    return TRUE;
+            }
+            break;
+
+        case WM_CLOSE:
+            EndDialog(hDlg, 0);
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// Build and show the configuration dialog
+static void show_config_dialog(void) {
+    BYTE buf[2048];
+    memset(buf, 0, sizeof(buf));
+    BYTE* ptr = buf;
+
+    // Dialog template header
+    DLGTEMPLATE* dlg = (DLGTEMPLATE*)ptr;
+    dlg->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFONT | DS_CENTER;
+    dlg->dwExtendedStyle = 0;
+    dlg->cdit = 5;  // 1 label + 4 buttons
+    dlg->x = 0;
+    dlg->y = 0;
+    dlg->cx = 254;
+    dlg->cy = 70;
+    ptr += sizeof(DLGTEMPLATE);
+
+    // Menu (none)
+    *(WORD*)ptr = 0;
+    ptr += sizeof(WORD);
+
+    // Class (default)
+    *(WORD*)ptr = 0;
+    ptr += sizeof(WORD);
+
+    // Title
+    const wchar_t* title = L"LockService Configuration";
+    size_t titleLen = wcslen(title) + 1;
+    memcpy(ptr, title, titleLen * sizeof(wchar_t));
+    ptr += titleLen * sizeof(wchar_t);
+
+    // Font (DS_SETFONT): size + name
+    *(WORD*)ptr = 8;
+    ptr += sizeof(WORD);
+    const wchar_t* font = L"Segoe UI";
+    size_t fontLen = wcslen(font) + 1;
+    memcpy(ptr, font, fontLen * sizeof(wchar_t));
+    ptr += fontLen * sizeof(wchar_t);
+
+    // Controls — uniform 14 DLU margin on all sides
+    short margin = 14;
+    short btnW = 52, btnH = 16, gap = 6;
+    short rowW = 4 * btnW + 3 * gap;   // 226
+    short btnY = 40;
+    short labelH = 12;
+
+    // Status label - left justified, vertically centered between dialog top and button top
+    ptr = AddDialogControl(ptr, IDC_STATUS_LABEL, 0x0082,  // STATIC
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        margin, (btnY - labelH) / 2, rowW, labelH, L"Status: Checking...");
+
+    ptr = AddDialogControl(ptr, IDC_BTN_INSTALL, 0x0080,  // BUTTON
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        margin, btnY, btnW, btnH, L"Install");
+
+    ptr = AddDialogControl(ptr, IDC_BTN_UNINSTALL, 0x0080,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        margin + (btnW + gap), btnY, btnW, btnH, L"Uninstall");
+
+    ptr = AddDialogControl(ptr, IDC_BTN_START, 0x0080,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        margin + 2 * (btnW + gap), btnY, btnW, btnH, L"Start");
+
+    ptr = AddDialogControl(ptr, IDC_BTN_STOP, 0x0080,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        margin + 3 * (btnW + gap), btnY, btnW, btnH, L"Stop");
+
+    DialogBoxIndirectParamW(GetModuleHandle(NULL), (DLGTEMPLATE*)buf, NULL, ConfigDialogProc, 0);
+}
+
 // Main entry point
 int main(int argc, char* argv[]) {
     // Validate argc before accessing argv
@@ -966,6 +1218,11 @@ int main(int argc, char* argv[]) {
     }
     
     if (argc > 1) {
+        // Reattach to parent console so printf/fprintf output is visible
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            freopen("CONOUT$", "w", stdout);
+            freopen("CONOUT$", "w", stderr);
+        }
         if (strcmp(argv[1], "install") == 0) {
             return install_service() ? 0 : 1;
         } else if (strcmp(argv[1], "uninstall") == 0) {
@@ -983,6 +1240,16 @@ int main(int argc, char* argv[]) {
     };
     
     if (!StartServiceCtrlDispatcherW(serviceTable)) {
+        if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
+            if (!IsUserAnAdmin()) {
+                MessageBoxW(NULL,
+                    L"This program must be run as Administrator to configure the service.",
+                    L"LockService", MB_ICONWARNING | MB_OK);
+                return 1;
+            }
+            show_config_dialog();
+            return 0;
+        }
         fprintf(stderr, "StartServiceCtrlDispatcher failed: %lu\n", GetLastError());
         fprintf(stderr, "This program must be run as a Windows Service\n");
         return 1;
