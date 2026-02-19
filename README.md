@@ -22,6 +22,7 @@ The service automatically tracks user sessions — attaching helpers when users 
 
 Double-click `LockService.exe` (as Administrator). A configuration dialog will appear with:
 
+- **Enable HTTP Service** / **Turn off monitor on WIN+L** checkboxes to independently toggle the HTTP server and the monitor-off behavior (both enabled by default).
 - **Bind IP / Bind Port** fields to configure what address and port the HTTP server listens on (defaults: `0.0.0.0` / `8888`). Changes are saved to the registry and take effect on the next service start. If the service is already running, saving will automatically restart it.
 - **Install**, **Uninstall**, **Restart**, **Start**, and **Stop** buttons (grayed out based on current service state).
 - Colored status indicator — green when running, red when stopped.
@@ -46,10 +47,12 @@ sc stop LockService
 
 Settings are stored in the registry at `HKLM\SOFTWARE\JPIT\LockService`:
 
-| Value      | Type      | Default   | Description                        |
-|------------|-----------|-----------|------------------------------------|
-| `BindIP`   | REG_SZ    | `0.0.0.0` | IP address the HTTP server binds to |
-| `BindPort` | REG_DWORD | `8888`    | Port the HTTP server listens on     |
+| Value             | Type      | Default   | Description                                |
+|-------------------|-----------|-----------|--------------------------------------------|
+| `BindIP`          | REG_SZ    | `0.0.0.0` | IP address the HTTP server binds to        |
+| `BindPort`        | REG_DWORD | `8888`    | Port the HTTP server listens on            |
+| `EnableHTTP`      | REG_DWORD | `1`       | Enable (1) or disable (0) the HTTP server  |
+| `EnableMonitorOff`| REG_DWORD | `1`       | Enable (1) or disable (0) monitor-off on WIN+L |
 
 These can be edited through the GUI dialog or directly in the registry for headless/scripted setups.
 
