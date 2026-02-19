@@ -43,11 +43,15 @@
 #define IDC_BTN_RESTART    111
 #define IDC_SEPARATOR      112
 #define IDC_STATUS_STATE   113
+#define IDC_CHK_ENABLE_HTTP    114
+#define IDC_CHK_ENABLE_MONOFF  115
 
 // Registry settings
 #define REG_KEY_PATH       "SOFTWARE\\JPIT\\LockService"
 #define REG_VALUE_BIND_IP  "BindIP"
 #define REG_VALUE_BIND_PORT "BindPort"
+#define REG_VALUE_ENABLE_HTTP   "EnableHTTP"
+#define REG_VALUE_ENABLE_MONOFF "EnableMonitorOff"
 
 #ifndef SS_ETCHEDHORZ
 #define SS_ETCHEDHORZ 0x00000010
@@ -56,6 +60,11 @@
 // Settings globals
 static char g_bindIP[64] = "0.0.0.0";
 static DWORD g_bindPort = 8888;
+static DWORD g_enableHTTP = 1;
+static DWORD g_enableMonitorOff = 1;
+
+// Forward declaration
+static void load_settings(void);
 
 // Service state for colored status tracking
 static int g_lastServiceState = -1;
@@ -181,8 +190,10 @@ static LRESULT CALLBACK raw_input_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, L
                             } else {
                                 log_info("Detected WIN+L press");
                             }
-							Sleep(500);
-                            SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+                            if (g_enableMonitorOff) {
+                                Sleep(500);
+                                SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+                            }
                         }
                     }
                 }
@@ -197,8 +208,10 @@ static LRESULT CALLBACK raw_input_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, L
         } else {
             log_info("Detected WIN+L press");
         }
-		Sleep(500);
-        SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+        if (g_enableMonitorOff) {
+            Sleep(500);
+            SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+        }
     }
     
     return DefWindowProcA(hwnd, msg, wParam, lParam);
@@ -246,8 +259,10 @@ static LRESULT CALLBACK keyboard_hook_proc(int nCode, WPARAM wParam, LPARAM lPar
                     }
                     
                     // Turn off monitors using SendMessage for reliability
-					Sleep(500);
-                    SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+                    if (g_enableMonitorOff) {
+                        Sleep(500);
+                        SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+                    }
                 }
             }
         }
@@ -260,6 +275,8 @@ static LRESULT CALLBACK keyboard_hook_proc(int nCode, WPARAM wParam, LPARAM lPar
 static void run_keyboard_hook_helper(void) {
 	if (!ensure_single_keyboard_helper_instance())
 		exit(0);
+
+    load_settings();
 
     MSG msg;
     HWND hwnd = NULL;
@@ -349,6 +366,7 @@ static void run_keyboard_hook_helper(void) {
 // Helper process entry point
 static void run_helper(void) {
     g_hEventLog = RegisterEventSourceA(NULL, SERVICE_NAME);
+    load_settings();
     
     if (!LockWorkStation()) {
         if (g_hEventLog) {
@@ -357,8 +375,10 @@ static void run_helper(void) {
         }
         exit(1);
     }
-	Sleep(500);
-    SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+    if (g_enableMonitorOff) {
+        Sleep(500);
+        SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+    }
     
     if (g_hEventLog) {
         DeregisterEventSource(g_hEventLog);
@@ -826,12 +846,30 @@ static void load_settings(void) {
             g_bindPort = port;
         }
 
+        DWORD val = 0;
+        size = sizeof(val);
+        if (RegQueryValueExA(hKey, REG_VALUE_ENABLE_HTTP, NULL, &type, (BYTE*)&val, &size) == ERROR_SUCCESS
+            && type == REG_DWORD) {
+            g_enableHTTP = val ? 1 : 0;
+        } else {
+            g_enableHTTP = 1;
+        }
+
+        val = 0;
+        size = sizeof(val);
+        if (RegQueryValueExA(hKey, REG_VALUE_ENABLE_MONOFF, NULL, &type, (BYTE*)&val, &size) == ERROR_SUCCESS
+            && type == REG_DWORD) {
+            g_enableMonitorOff = val ? 1 : 0;
+        } else {
+            g_enableMonitorOff = 1;
+        }
+
         RegCloseKey(hKey);
     }
 }
 
 // Save bind settings to registry
-static BOOL save_settings(const char* ip, DWORD port) {
+static BOOL save_settings(const char* ip, DWORD port, DWORD enableHTTP, DWORD enableMonOff) {
     HKEY hKey;
     DWORD disp;
     if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, REG_KEY_PATH, 0, NULL, 0, KEY_WRITE, NULL, &hKey, &disp) != ERROR_SUCCESS)
@@ -842,6 +880,15 @@ static BOOL save_settings(const char* ip, DWORD port) {
         ok = FALSE;
     if (RegSetValueExA(hKey, REG_VALUE_BIND_PORT, 0, REG_DWORD, (const BYTE*)&port, sizeof(port)) != ERROR_SUCCESS)
         ok = FALSE;
+    if (RegSetValueExA(hKey, REG_VALUE_ENABLE_HTTP, 0, REG_DWORD, (const BYTE*)&enableHTTP, sizeof(enableHTTP)) != ERROR_SUCCESS)
+        ok = FALSE;
+    if (RegSetValueExA(hKey, REG_VALUE_ENABLE_MONOFF, 0, REG_DWORD, (const BYTE*)&enableMonOff, sizeof(enableMonOff)) != ERROR_SUCCESS)
+        ok = FALSE;
+
+    if (ok) {
+        g_enableHTTP = enableHTTP;
+        g_enableMonitorOff = enableMonOff;
+    }
 
     RegCloseKey(hKey);
     return ok;
@@ -880,18 +927,21 @@ static void WINAPI service_main(DWORD argc, LPWSTR* argv) {
     // Load bind settings from registry
     load_settings();
 
-    // Start HTTP server thread
-    HANDLE hHttpThread = CreateThread(NULL, 0, http_server_thread, NULL, 0, NULL);
-    if (!hHttpThread) {
-        DWORD dwError = GetLastError();
-        log_error("Failed to create HTTP server thread: %lu", dwError);
-        DeleteCriticalSection(&g_SessionLock);
-        CloseHandle(g_ServiceStopEvent);
-        if (g_hEventLog) DeregisterEventSource(g_hEventLog);
-        g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
-        g_ServiceStatus.dwWin32ExitCode = dwError;
-        SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
-        return;
+    // Start HTTP server thread (if enabled)
+    HANDLE hHttpThread = NULL;
+    if (g_enableHTTP) {
+        hHttpThread = CreateThread(NULL, 0, http_server_thread, NULL, 0, NULL);
+        if (!hHttpThread) {
+            DWORD dwError = GetLastError();
+            log_error("Failed to create HTTP server thread: %lu", dwError);
+            DeleteCriticalSection(&g_SessionLock);
+            CloseHandle(g_ServiceStopEvent);
+            if (g_hEventLog) DeregisterEventSource(g_hEventLog);
+            g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+            g_ServiceStatus.dwWin32ExitCode = dwError;
+            SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+            return;
+        }
     }
     
     // Start session monitoring thread (does immediate check, then every 10 seconds)
@@ -900,8 +950,10 @@ static void WINAPI service_main(DWORD argc, LPWSTR* argv) {
         DWORD dwError = GetLastError();
         log_error("Failed to create session monitor thread: %lu", dwError);
         SetEvent(g_ServiceStopEvent);
-        WaitForSingleObject(hHttpThread, THREAD_SHUTDOWN_TIMEOUT_MS);
-        CloseHandle(hHttpThread);
+        if (hHttpThread) {
+            WaitForSingleObject(hHttpThread, THREAD_SHUTDOWN_TIMEOUT_MS);
+            CloseHandle(hHttpThread);
+        }
         DeleteCriticalSection(&g_SessionLock);
         CloseHandle(g_ServiceStopEvent);
         if (g_hEventLog) DeregisterEventSource(g_hEventLog);
@@ -1194,27 +1246,38 @@ static void RefreshButtonStates(HWND hDlg) {
 static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     static char origIP[64];
     static DWORD origPort;
+    static DWORD origEnableHTTP;
+    static DWORD origEnableMonOff;
 
     switch (msg) {
         case WM_INITDIALOG:
             load_settings();
             SetDlgItemTextA(hDlg, IDC_EDIT_BIND_IP, g_bindIP);
             SetDlgItemInt(hDlg, IDC_EDIT_BIND_PORT, g_bindPort, FALSE);
+            CheckDlgButton(hDlg, IDC_CHK_ENABLE_HTTP, g_enableHTTP ? BST_CHECKED : BST_UNCHECKED);
+            CheckDlgButton(hDlg, IDC_CHK_ENABLE_MONOFF, g_enableMonitorOff ? BST_CHECKED : BST_UNCHECKED);
             strncpy(origIP, g_bindIP, sizeof(origIP));
             origIP[sizeof(origIP) - 1] = '\0';
             origPort = g_bindPort;
+            origEnableHTTP = g_enableHTTP;
+            origEnableMonOff = g_enableMonitorOff;
             EnableWindow(GetDlgItem(hDlg, IDC_BTN_SAVE), FALSE);
             RefreshButtonStates(hDlg);
             return TRUE;
 
         case WM_COMMAND:
-            // Dirty tracking for edit controls
-            if (HIWORD(wParam) == EN_CHANGE &&
-                (LOWORD(wParam) == IDC_EDIT_BIND_IP || LOWORD(wParam) == IDC_EDIT_BIND_PORT)) {
+            // Dirty tracking for edit controls and checkboxes
+            if ((HIWORD(wParam) == EN_CHANGE &&
+                 (LOWORD(wParam) == IDC_EDIT_BIND_IP || LOWORD(wParam) == IDC_EDIT_BIND_PORT)) ||
+                (HIWORD(wParam) == BN_CLICKED &&
+                 (LOWORD(wParam) == IDC_CHK_ENABLE_HTTP || LOWORD(wParam) == IDC_CHK_ENABLE_MONOFF))) {
                 char curIP[64] = {0};
                 GetDlgItemTextA(hDlg, IDC_EDIT_BIND_IP, curIP, sizeof(curIP));
                 DWORD curPort = GetDlgItemInt(hDlg, IDC_EDIT_BIND_PORT, NULL, FALSE);
-                BOOL dirty = (strcmp(curIP, origIP) != 0 || curPort != origPort);
+                DWORD curHTTP = (IsDlgButtonChecked(hDlg, IDC_CHK_ENABLE_HTTP) == BST_CHECKED) ? 1 : 0;
+                DWORD curMonOff = (IsDlgButtonChecked(hDlg, IDC_CHK_ENABLE_MONOFF) == BST_CHECKED) ? 1 : 0;
+                BOOL dirty = (strcmp(curIP, origIP) != 0 || curPort != origPort ||
+                              curHTTP != origEnableHTTP || curMonOff != origEnableMonOff);
                 EnableWindow(GetDlgItem(hDlg, IDC_BTN_SAVE), dirty);
                 return TRUE;
             }
@@ -1241,7 +1304,10 @@ static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPA
                         return TRUE;
                     }
 
-                    if (!save_settings(ip, (DWORD)port)) {
+                    DWORD enHTTP = (IsDlgButtonChecked(hDlg, IDC_CHK_ENABLE_HTTP) == BST_CHECKED) ? 1 : 0;
+                    DWORD enMonOff = (IsDlgButtonChecked(hDlg, IDC_CHK_ENABLE_MONOFF) == BST_CHECKED) ? 1 : 0;
+
+                    if (!save_settings(ip, (DWORD)port, enHTTP, enMonOff)) {
                         MessageBoxW(hDlg, L"Failed to save settings to registry.", L"Error", MB_ICONERROR);
                         return TRUE;
                     }
@@ -1250,6 +1316,8 @@ static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPA
                     strncpy(origIP, ip, sizeof(origIP));
                     origIP[sizeof(origIP) - 1] = '\0';
                     origPort = (DWORD)port;
+                    origEnableHTTP = enHTTP;
+                    origEnableMonOff = enMonOff;
                     EnableWindow(GetDlgItem(hDlg, IDC_BTN_SAVE), FALSE);
 
                     // Restart service if running
@@ -1325,11 +1393,11 @@ static void show_config_dialog(void) {
     DLGTEMPLATE* dlg = (DLGTEMPLATE*)ptr;
     dlg->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFONT | DS_CENTER;
     dlg->dwExtendedStyle = 0;
-    dlg->cdit = 13;  // 2 status + 2 labels + 2 edits + 1 save + 1 separator + 5 buttons
+    dlg->cdit = 15;  // 2 status + 2 checkboxes + 2 labels + 2 edits + 1 save + 1 separator + 5 buttons
     dlg->x = 0;
     dlg->y = 0;
     dlg->cx = 254;
-    dlg->cy = 138;
+    dlg->cy = 168;
     ptr += sizeof(DLGTEMPLATE);
 
     // Menu (none)
@@ -1371,56 +1439,66 @@ static void show_config_dialog(void) {
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         margin, 14, contentW, 12, L"");
 
-    // 2. Bind IP label (y=38 for vertical centering with 14-tall edit at y=36)
+    // 2a. Enable HTTP checkbox (y=32)
+    ptr = AddDialogControl(ptr, IDC_CHK_ENABLE_HTTP, 0x0080,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        margin, 32, contentW, 12, L"Enable HTTP Service");
+
+    // 2b. Enable Monitor Off checkbox (y=46)
+    ptr = AddDialogControl(ptr, IDC_CHK_ENABLE_MONOFF, 0x0080,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        margin, 46, contentW, 12, L"Turn off monitor on WIN+L");
+
+    // 3. Bind IP label (y=68 for vertical centering with 14-tall edit at y=66)
     ptr = AddDialogControl(ptr, IDC_LBL_BIND_IP, 0x0082,
         WS_CHILD | WS_VISIBLE | SS_LEFT,
-        margin, 38, lblW, 12, L"Bind IP:");
+        margin, 68, lblW, 12, L"Bind IP:");
 
-    // 3. Bind IP edit (y=36, h=14)
+    // 4. Bind IP edit (y=66, h=14)
     ptr = AddDialogControl(ptr, IDC_EDIT_BIND_IP, 0x0081,
         WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-        editX, 36, editW, 14, L"");
+        editX, 66, editW, 14, L"");
 
-    // 4. Bind Port label (y=58 for vertical centering with 14-tall edit at y=56)
+    // 5. Bind Port label (y=88 for vertical centering with 14-tall edit at y=86)
     ptr = AddDialogControl(ptr, IDC_LBL_BIND_PORT, 0x0082,
         WS_CHILD | WS_VISIBLE | SS_LEFT,
-        margin, 58, lblW, 12, L"Bind Port:");
+        margin, 88, lblW, 12, L"Bind Port:");
 
-    // 5. Bind Port edit (y=56, h=14) — ES_NUMBER for digits only
+    // 6. Bind Port edit (y=86, h=14) — ES_NUMBER for digits only
     ptr = AddDialogControl(ptr, IDC_EDIT_BIND_PORT, 0x0081,
         WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
-        editX, 56, 50, 14, L"");
+        editX, 86, 50, 14, L"");
 
-    // 6. Save button (y=78, h=16) — right-aligned
+    // 7. Save button (y=108, h=16) — right-aligned
     ptr = AddDialogControl(ptr, IDC_BTN_SAVE, 0x0080,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        margin + contentW - btnW, 78, btnW, btnH, L"Save");
+        margin + contentW - btnW, 108, btnW, btnH, L"Save");
 
-    // 7. Etched horizontal separator (y=100, h=2)
+    // 8. Etched horizontal separator (y=130, h=2)
     ptr = AddDialogControl(ptr, IDC_SEPARATOR, 0x0082,
         WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-        0, 100, 254, 2, L"");
+        0, 130, 254, 2, L"");
 
-    // 8-12. Bottom buttons (y=108, h=16): Install, Uninstall, Restart, Start, Stop
+    // 9-13. Bottom buttons (y=138, h=16): Install, Uninstall, Restart, Start, Stop
     ptr = AddDialogControl(ptr, IDC_BTN_INSTALL, 0x0080,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        margin, 108, btnW, btnH, L"Install");
+        margin, 138, btnW, btnH, L"Install");
 
     ptr = AddDialogControl(ptr, IDC_BTN_UNINSTALL, 0x0080,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        margin + (btnW + gap), 108, btnW, btnH, L"Uninstall");
+        margin + (btnW + gap), 138, btnW, btnH, L"Uninstall");
 
     ptr = AddDialogControl(ptr, IDC_BTN_RESTART, 0x0080,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        margin + 2 * (btnW + gap), 108, btnW, btnH, L"Restart");
+        margin + 2 * (btnW + gap), 138, btnW, btnH, L"Restart");
 
     ptr = AddDialogControl(ptr, IDC_BTN_START, 0x0080,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        margin + 3 * (btnW + gap), 108, btnW, btnH, L"Start");
+        margin + 3 * (btnW + gap), 138, btnW, btnH, L"Start");
 
     ptr = AddDialogControl(ptr, IDC_BTN_STOP, 0x0080,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        margin + 4 * (btnW + gap), 108, btnW, btnH, L"Stop");
+        margin + 4 * (btnW + gap), 138, btnW, btnH, L"Stop");
 
     DialogBoxIndirectParamW(GetModuleHandle(NULL), (DLGTEMPLATE*)buf, NULL, ConfigDialogProc, 0);
 }
