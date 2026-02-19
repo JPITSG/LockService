@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <shlobj.h>
+#include <tlhelp32.h>
 
 #define SERVICE_NAME "LockService"
 #define SERVICE_DISPLAY_NAME_W L"Lock Screen Service"
@@ -999,6 +1000,36 @@ static void WINAPI service_main(DWORD argc, LPWSTR* argv) {
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
 }
 
+// Kill all other LockService.exe instances (helpers, hooks, service) except ourselves
+static void kill_other_instances(void) {
+    DWORD myPid = GetCurrentProcessId();
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return;
+
+    WCHAR myExe[MAX_PATH];
+    GetModuleFileNameW(NULL, myExe, MAX_PATH);
+    WCHAR *myName = wcsrchr(myExe, L'\\');
+    myName = myName ? myName + 1 : myExe;
+
+    PROCESSENTRY32W pe = {0};
+    pe.dwSize = sizeof(pe);
+
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (pe.th32ProcessID != myPid && _wcsicmp(pe.szExeFile, myName) == 0) {
+                HANDLE hProc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+                if (hProc) {
+                    TerminateProcess(hProc, 0);
+                    WaitForSingleObject(hProc, 2000);
+                    CloseHandle(hProc);
+                }
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+
+    CloseHandle(hSnap);
+}
+
 // Install the service
 static BOOL install_service(void) {
     SC_HANDLE scm = NULL, svc = NULL;
@@ -1069,7 +1100,8 @@ static BOOL uninstall_service(void) {
     
     ControlService(svc, SERVICE_CONTROL_STOP, &status);
     Sleep(1000);
-    
+    kill_other_instances();
+
     if (DeleteService(svc)) {
         printf("Service uninstalled successfully\n");
         bResult = TRUE;
@@ -1102,7 +1134,7 @@ cleanup:
     return bResult;
 }
 
-// Stop the service via SCM
+// Stop the service via SCM and kill all remaining instances
 static BOOL stop_service(void) {
     SC_HANDLE scm = NULL, svc = NULL;
     SERVICE_STATUS status;
@@ -1119,6 +1151,11 @@ static BOOL stop_service(void) {
 cleanup:
     if (svc) CloseServiceHandle(svc);
     if (scm) CloseServiceHandle(scm);
+
+    // Ensure all other instances (service, helpers, hooks) are terminated
+    Sleep(500);
+    kill_other_instances();
+
     return bResult;
 }
 
