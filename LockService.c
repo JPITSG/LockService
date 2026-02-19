@@ -1,6 +1,9 @@
 // lockservice_nowindow.c
 // Compile with: x86_64-w64-mingw32-gcc -O2 -Wall -o LockService.exe lockservice_nowindow.c -lws2_32 -ladvapi32 -lwtsapi32 -luserenv -s
 
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -32,6 +35,30 @@
 #define IDC_BTN_UNINSTALL 103
 #define IDC_BTN_START    104
 #define IDC_BTN_STOP     105
+#define IDC_LBL_BIND_IP   106
+#define IDC_EDIT_BIND_IP   107
+#define IDC_LBL_BIND_PORT  108
+#define IDC_EDIT_BIND_PORT 109
+#define IDC_BTN_SAVE       110
+#define IDC_BTN_RESTART    111
+#define IDC_SEPARATOR      112
+#define IDC_STATUS_STATE   113
+
+// Registry settings
+#define REG_KEY_PATH       "SOFTWARE\\JPIT\\LockService"
+#define REG_VALUE_BIND_IP  "BindIP"
+#define REG_VALUE_BIND_PORT "BindPort"
+
+#ifndef SS_ETCHEDHORZ
+#define SS_ETCHEDHORZ 0x00000010
+#endif
+
+// Settings globals
+static char g_bindIP[64] = "0.0.0.0";
+static DWORD g_bindPort = 8888;
+
+// Service state for colored status tracking
+static int g_lastServiceState = -1;
 
 // Global service status handle
 static SERVICE_STATUS g_ServiceStatus;
@@ -702,12 +729,13 @@ static DWORD WINAPI http_server_thread(LPVOID param) {
     setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
     
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(HTTP_PORT);
+    if (inet_pton(AF_INET, g_bindIP, &addr.sin_addr) != 1)
+        addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((u_short)g_bindPort);
     
     if (bind(listenSocket, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
         dwError = WSAGetLastError();
-        log_error("Bind failed on port %d: %d", HTTP_PORT, dwError);
+        log_error("Bind failed on port %lu: %d", g_bindPort, dwError);
         goto cleanup;
     }
     
@@ -778,6 +806,47 @@ static void WINAPI service_ctrl_handler(DWORD ctrl) {
     }
 }
 
+// Load bind settings from registry
+static void load_settings(void) {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, REG_KEY_PATH, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD type, size;
+
+        size = sizeof(g_bindIP);
+        if (RegQueryValueExA(hKey, REG_VALUE_BIND_IP, NULL, &type, (BYTE*)g_bindIP, &size) != ERROR_SUCCESS
+            || type != REG_SZ || size == 0) {
+            strcpy(g_bindIP, "0.0.0.0");
+        }
+        g_bindIP[sizeof(g_bindIP) - 1] = '\0';
+
+        DWORD port = 0;
+        size = sizeof(port);
+        if (RegQueryValueExA(hKey, REG_VALUE_BIND_PORT, NULL, &type, (BYTE*)&port, &size) == ERROR_SUCCESS
+            && type == REG_DWORD && port >= 1 && port <= 65535) {
+            g_bindPort = port;
+        }
+
+        RegCloseKey(hKey);
+    }
+}
+
+// Save bind settings to registry
+static BOOL save_settings(const char* ip, DWORD port) {
+    HKEY hKey;
+    DWORD disp;
+    if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, REG_KEY_PATH, 0, NULL, 0, KEY_WRITE, NULL, &hKey, &disp) != ERROR_SUCCESS)
+        return FALSE;
+
+    BOOL ok = TRUE;
+    if (RegSetValueExA(hKey, REG_VALUE_BIND_IP, 0, REG_SZ, (const BYTE*)ip, (DWORD)strlen(ip) + 1) != ERROR_SUCCESS)
+        ok = FALSE;
+    if (RegSetValueExA(hKey, REG_VALUE_BIND_PORT, 0, REG_DWORD, (const BYTE*)&port, sizeof(port)) != ERROR_SUCCESS)
+        ok = FALSE;
+
+    RegCloseKey(hKey);
+    return ok;
+}
+
 // Service main function
 static void WINAPI service_main(DWORD argc, LPWSTR* argv) {
     g_StatusHandle = RegisterServiceCtrlHandlerW(L"LockService", service_ctrl_handler);
@@ -807,7 +876,10 @@ static void WINAPI service_main(DWORD argc, LPWSTR* argv) {
     // Initialize session tracking
     InitializeCriticalSection(&g_SessionLock);
     g_HelperProcCount = 0;
-    
+
+    // Load bind settings from registry
+    load_settings();
+
     // Start HTTP server thread
     HANDLE hHttpThread = CreateThread(NULL, 0, http_server_thread, NULL, 0, NULL);
     if (!hHttpThread) {
@@ -998,6 +1070,13 @@ cleanup:
     return bResult;
 }
 
+// Restart the service (stop then start)
+static BOOL restart_service(void) {
+    stop_service();
+    Sleep(500);
+    return start_service();
+}
+
 // Helper to add a control to dialog template
 static BYTE* AddDialogControl(BYTE* ptr, WORD ctrlId, WORD classAtom, DWORD style,
                                short posX, short posY, short width, short height,
@@ -1070,34 +1149,125 @@ static int query_service_state(void) {
 // Update button enable states based on current service state
 static void RefreshButtonStates(HWND hDlg) {
     int state = query_service_state();
-    const wchar_t* statusText;
+    g_lastServiceState = state;
+    const wchar_t* prefixText;
+    const wchar_t* stateText;
 
     switch (state) {
-        case 0: statusText = L"Status: Not Installed"; break;
-        case 1: statusText = L"Status: Installed (Stopped)"; break;
-        case 2: statusText = L"Status: Installed (Running)"; break;
-        case 3: statusText = L"Status: Installed (Transitioning...)"; break;
-        default: statusText = L"Status: Unknown"; break;
+        case 0: prefixText = L"Status: Not Installed"; stateText = L""; break;
+        case 1: prefixText = L"Status: Installed "; stateText = L"(Stopped)"; break;
+        case 2: prefixText = L"Status: Installed "; stateText = L"(Running)"; break;
+        case 3: prefixText = L"Status: Installed "; stateText = L"(Transitioning...)"; break;
+        default: prefixText = L"Status: Unknown"; stateText = L""; break;
     }
 
-    SetDlgItemTextW(hDlg, IDC_STATUS_LABEL, statusText);
+    SetDlgItemTextW(hDlg, IDC_STATUS_LABEL, prefixText);
+    SetDlgItemTextW(hDlg, IDC_STATUS_STATE, stateText);
+
+    // Measure prefix width and reposition state label right after it
+    HDC hdc = GetDC(hDlg);
+    HFONT hFont = (HFONT)SendDlgItemMessage(hDlg, IDC_STATUS_LABEL, WM_GETFONT, 0, 0);
+    HGDIOBJ hOld = NULL;
+    if (hFont) hOld = SelectObject(hdc, hFont);
+    SIZE sz;
+    GetTextExtentPoint32W(hdc, prefixText, (int)wcslen(prefixText), &sz);
+    if (hOld) SelectObject(hdc, hOld);
+    ReleaseDC(hDlg, hdc);
+
+    RECT rc;
+    GetWindowRect(GetDlgItem(hDlg, IDC_STATUS_LABEL), &rc);
+    MapWindowPoints(NULL, hDlg, (POINT*)&rc, 2);
+    SetWindowPos(GetDlgItem(hDlg, IDC_STATUS_STATE), NULL,
+        rc.left + sz.cx, rc.top, rc.right - rc.left - sz.cx, rc.bottom - rc.top,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+    InvalidateRect(GetDlgItem(hDlg, IDC_STATUS_STATE), NULL, TRUE);
 
     BOOL installed = (state > 0);
     EnableWindow(GetDlgItem(hDlg, IDC_BTN_INSTALL),   !installed);
     EnableWindow(GetDlgItem(hDlg, IDC_BTN_UNINSTALL),  installed);
+    EnableWindow(GetDlgItem(hDlg, IDC_BTN_RESTART),    installed && state == 2);
     EnableWindow(GetDlgItem(hDlg, IDC_BTN_START),      installed && state == 1);
     EnableWindow(GetDlgItem(hDlg, IDC_BTN_STOP),       installed && state == 2);
 }
 
 // Configuration dialog procedure
 static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static char origIP[64];
+    static DWORD origPort;
+
     switch (msg) {
         case WM_INITDIALOG:
+            load_settings();
+            SetDlgItemTextA(hDlg, IDC_EDIT_BIND_IP, g_bindIP);
+            SetDlgItemInt(hDlg, IDC_EDIT_BIND_PORT, g_bindPort, FALSE);
+            strncpy(origIP, g_bindIP, sizeof(origIP));
+            origIP[sizeof(origIP) - 1] = '\0';
+            origPort = g_bindPort;
+            EnableWindow(GetDlgItem(hDlg, IDC_BTN_SAVE), FALSE);
             RefreshButtonStates(hDlg);
             return TRUE;
 
         case WM_COMMAND:
+            // Dirty tracking for edit controls
+            if (HIWORD(wParam) == EN_CHANGE &&
+                (LOWORD(wParam) == IDC_EDIT_BIND_IP || LOWORD(wParam) == IDC_EDIT_BIND_PORT)) {
+                char curIP[64] = {0};
+                GetDlgItemTextA(hDlg, IDC_EDIT_BIND_IP, curIP, sizeof(curIP));
+                DWORD curPort = GetDlgItemInt(hDlg, IDC_EDIT_BIND_PORT, NULL, FALSE);
+                BOOL dirty = (strcmp(curIP, origIP) != 0 || curPort != origPort);
+                EnableWindow(GetDlgItem(hDlg, IDC_BTN_SAVE), dirty);
+                return TRUE;
+            }
+
             switch (LOWORD(wParam)) {
+                case IDC_BTN_SAVE: {
+                    char ip[64] = {0};
+                    GetDlgItemTextA(hDlg, IDC_EDIT_BIND_IP, ip, sizeof(ip));
+
+                    // Validate IP
+                    struct in_addr tmpAddr;
+                    if (inet_pton(AF_INET, ip, &tmpAddr) != 1) {
+                        MessageBoxW(hDlg, L"Invalid IP address.", L"Validation Error", MB_ICONERROR);
+                        SetFocus(GetDlgItem(hDlg, IDC_EDIT_BIND_IP));
+                        return TRUE;
+                    }
+
+                    // Validate port
+                    BOOL translated = FALSE;
+                    UINT port = GetDlgItemInt(hDlg, IDC_EDIT_BIND_PORT, &translated, FALSE);
+                    if (!translated || port < 1 || port > 65535) {
+                        MessageBoxW(hDlg, L"Port must be between 1 and 65535.", L"Validation Error", MB_ICONERROR);
+                        SetFocus(GetDlgItem(hDlg, IDC_EDIT_BIND_PORT));
+                        return TRUE;
+                    }
+
+                    if (!save_settings(ip, (DWORD)port)) {
+                        MessageBoxW(hDlg, L"Failed to save settings to registry.", L"Error", MB_ICONERROR);
+                        return TRUE;
+                    }
+
+                    // Update originals and disable Save
+                    strncpy(origIP, ip, sizeof(origIP));
+                    origIP[sizeof(origIP) - 1] = '\0';
+                    origPort = (DWORD)port;
+                    EnableWindow(GetDlgItem(hDlg, IDC_BTN_SAVE), FALSE);
+
+                    // Restart service if running
+                    if (g_lastServiceState == 2) {
+                        restart_service();
+                        Sleep(500);
+                    }
+
+                    RefreshButtonStates(hDlg);
+                    return TRUE;
+                }
+
+                case IDC_BTN_RESTART:
+                    restart_service();
+                    Sleep(500);
+                    RefreshButtonStates(hDlg);
+                    return TRUE;
+
                 case IDC_BTN_INSTALL:
                     if (!install_service())
                         MessageBoxW(hDlg, L"Failed to install service.", L"Error", MB_ICONERROR);
@@ -1126,6 +1296,18 @@ static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPA
             }
             break;
 
+        case WM_CTLCOLORSTATIC:
+            if ((HWND)lParam == GetDlgItem(hDlg, IDC_STATUS_STATE)) {
+                HDC hdc = (HDC)wParam;
+                if (g_lastServiceState == 2)
+                    SetTextColor(hdc, RGB(0, 128, 0));
+                else if (g_lastServiceState == 1)
+                    SetTextColor(hdc, RGB(192, 0, 0));
+                SetBkMode(hdc, TRANSPARENT);
+                return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
+            }
+            break;
+
         case WM_CLOSE:
             EndDialog(hDlg, 0);
             return TRUE;
@@ -1135,7 +1317,7 @@ static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPA
 
 // Build and show the configuration dialog
 static void show_config_dialog(void) {
-    BYTE buf[2048];
+    BYTE buf[4096];
     memset(buf, 0, sizeof(buf));
     BYTE* ptr = buf;
 
@@ -1143,11 +1325,11 @@ static void show_config_dialog(void) {
     DLGTEMPLATE* dlg = (DLGTEMPLATE*)ptr;
     dlg->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFONT | DS_CENTER;
     dlg->dwExtendedStyle = 0;
-    dlg->cdit = 5;  // 1 label + 4 buttons
+    dlg->cdit = 13;  // 2 status + 2 labels + 2 edits + 1 save + 1 separator + 5 buttons
     dlg->x = 0;
     dlg->y = 0;
     dlg->cx = 254;
-    dlg->cy = 70;
+    dlg->cy = 138;
     ptr += sizeof(DLGTEMPLATE);
 
     // Menu (none)
@@ -1172,33 +1354,73 @@ static void show_config_dialog(void) {
     memcpy(ptr, font, fontLen * sizeof(wchar_t));
     ptr += fontLen * sizeof(wchar_t);
 
-    // Controls — uniform 14 DLU margin on all sides
     short margin = 14;
-    short btnW = 52, btnH = 16, gap = 6;
-    short rowW = 4 * btnW + 3 * gap;   // 226
-    short btnY = 40;
-    short labelH = 12;
+    short contentW = 226;
+    short lblW = 42;
+    short editX = margin + lblW + 2;
+    short editW = contentW - lblW - 2;
+    short btnW = 42, btnH = 16, gap = 4;
 
-    // Status label - left justified, vertically centered between dialog top and button top
-    ptr = AddDialogControl(ptr, IDC_STATUS_LABEL, 0x0082,  // STATIC
+    // 1a. Status prefix label (y=14, h=12)
+    ptr = AddDialogControl(ptr, IDC_STATUS_LABEL, 0x0082,
         WS_CHILD | WS_VISIBLE | SS_LEFT,
-        margin, (btnY - labelH) / 2, rowW, labelH, L"Status: Checking...");
+        margin, 14, contentW, 12, L"Status: Checking...");
 
-    ptr = AddDialogControl(ptr, IDC_BTN_INSTALL, 0x0080,  // BUTTON
+    // 1b. Status state label — colored, repositioned dynamically
+    ptr = AddDialogControl(ptr, IDC_STATUS_STATE, 0x0082,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        margin, 14, contentW, 12, L"");
+
+    // 2. Bind IP label (y=38 for vertical centering with 14-tall edit at y=36)
+    ptr = AddDialogControl(ptr, IDC_LBL_BIND_IP, 0x0082,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        margin, 38, lblW, 12, L"Bind IP:");
+
+    // 3. Bind IP edit (y=36, h=14)
+    ptr = AddDialogControl(ptr, IDC_EDIT_BIND_IP, 0x0081,
+        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+        editX, 36, editW, 14, L"");
+
+    // 4. Bind Port label (y=58 for vertical centering with 14-tall edit at y=56)
+    ptr = AddDialogControl(ptr, IDC_LBL_BIND_PORT, 0x0082,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        margin, 58, lblW, 12, L"Bind Port:");
+
+    // 5. Bind Port edit (y=56, h=14) — ES_NUMBER for digits only
+    ptr = AddDialogControl(ptr, IDC_EDIT_BIND_PORT, 0x0081,
+        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
+        editX, 56, 50, 14, L"");
+
+    // 6. Save button (y=78, h=16) — right-aligned
+    ptr = AddDialogControl(ptr, IDC_BTN_SAVE, 0x0080,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        margin, btnY, btnW, btnH, L"Install");
+        margin + contentW - btnW, 78, btnW, btnH, L"Save");
+
+    // 7. Etched horizontal separator (y=100, h=2)
+    ptr = AddDialogControl(ptr, IDC_SEPARATOR, 0x0082,
+        WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+        0, 100, 254, 2, L"");
+
+    // 8-12. Bottom buttons (y=108, h=16): Install, Uninstall, Restart, Start, Stop
+    ptr = AddDialogControl(ptr, IDC_BTN_INSTALL, 0x0080,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        margin, 108, btnW, btnH, L"Install");
 
     ptr = AddDialogControl(ptr, IDC_BTN_UNINSTALL, 0x0080,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        margin + (btnW + gap), btnY, btnW, btnH, L"Uninstall");
+        margin + (btnW + gap), 108, btnW, btnH, L"Uninstall");
+
+    ptr = AddDialogControl(ptr, IDC_BTN_RESTART, 0x0080,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        margin + 2 * (btnW + gap), 108, btnW, btnH, L"Restart");
 
     ptr = AddDialogControl(ptr, IDC_BTN_START, 0x0080,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        margin + 2 * (btnW + gap), btnY, btnW, btnH, L"Start");
+        margin + 3 * (btnW + gap), 108, btnW, btnH, L"Start");
 
     ptr = AddDialogControl(ptr, IDC_BTN_STOP, 0x0080,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        margin + 3 * (btnW + gap), btnY, btnW, btnH, L"Stop");
+        margin + 4 * (btnW + gap), 108, btnW, btnH, L"Stop");
 
     DialogBoxIndirectParamW(GetModuleHandle(NULL), (DLGTEMPLATE*)buf, NULL, ConfigDialogProc, 0);
 }
