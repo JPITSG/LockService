@@ -36,6 +36,8 @@
 #define IDI_APP_ICON 100
 #define IDR_HTML_UI 200
 #define IDR_WEBVIEW2_DLL 201
+#define ID_TIMER_WEBVIEW_SHOW_FALLBACK 202
+#define WEBVIEW_SHOW_FALLBACK_DELAY_MS 350
 
 // Registry settings
 #define REG_KEY_PATH       "SOFTWARE\\JPIT\\LockService"
@@ -1504,6 +1506,14 @@ static void webview_execute_script(const wchar_t* script) {
     }
 }
 
+static void webview_sync_controller_bounds(void) {
+    if (!g_webviewController || !g_hWnd) return;
+    RECT bounds;
+    GetClientRect(g_hWnd, &bounds);
+    g_webviewController->lpVtbl->put_Bounds(g_webviewController, bounds);
+    g_webviewController->lpVtbl->put_IsVisible(g_webviewController, TRUE);
+}
+
 // Send settings to JS
 static void webview_push_settings(void) {
     wchar_t script[512];
@@ -1663,6 +1673,7 @@ static HRESULT STDMETHODCALLTYPE CtrlCompleted_Invoke(ICoreWebView2CreateCoreWeb
     RECT bounds;
     GetClientRect(g_hWnd, &bounds);
     controller->lpVtbl->put_Bounds(controller, bounds);
+    controller->lpVtbl->put_IsVisible(controller, TRUE);
 
     // Get the core webview
     ICoreWebView2 *webview = NULL;
@@ -1809,9 +1820,11 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
                 flags |= SWP_NOACTIVATE;
             } else {
                 flags |= SWP_SHOWWINDOW;
+                KillTimer(g_hWnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
             }
             SetWindowPos(g_hWnd, NULL, 0, 0, windowW, newWindowH, flags);
             g_webviewWindowShown = TRUE;
+            webview_sync_controller_bounds();
         }
     }
 
@@ -1826,15 +1839,25 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
 static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_SIZE:
-            if (g_webviewController) {
-                RECT bounds;
-                GetClientRect(hwnd, &bounds);
-                g_webviewController->lpVtbl->put_Bounds(g_webviewController, bounds);
-            }
+            webview_sync_controller_bounds();
             return 0;
+
+        case WM_TIMER:
+            if (wParam == ID_TIMER_WEBVIEW_SHOW_FALLBACK) {
+                KillTimer(hwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
+                if (!g_webviewWindowShown) {
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    UpdateWindow(hwnd);
+                    g_webviewWindowShown = TRUE;
+                    webview_sync_controller_bounds();
+                }
+                return 0;
+            }
+            break;
 
         case WM_CLOSE:
             g_webviewWindowShown = FALSE;
+            KillTimer(hwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
             if (g_webviewController) {
                 g_webviewController->lpVtbl->Close(g_webviewController);
                 g_webviewController->lpVtbl->Release(g_webviewController);
@@ -1853,6 +1876,7 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
         case WM_DESTROY:
             g_webviewWindowShown = FALSE;
+            KillTimer(hwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
             PostQuitMessage(0);
             return 0;
     }
@@ -1897,6 +1921,7 @@ static void show_webview_config(void) {
         return;
     }
     g_webviewWindowShown = FALSE;
+    SetTimer(g_hWnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK, WEBVIEW_SHOW_FALLBACK_DELAY_MS, NULL);
 
     // Build user data folder path in %TEMP%
     WCHAR userDataFolder[MAX_PATH];
