@@ -1429,34 +1429,68 @@ static WCHAR g_extractedDllPath[MAX_PATH] = {0};
 static BOOL load_webview2_loader(void) {
     // Extract embedded WebView2Loader.dll from resources to %TEMP%
     HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(IDR_WEBVIEW2_DLL), RT_RCDATA);
-    if (hRes) {
-        HGLOBAL hData = LoadResource(NULL, hRes);
-        DWORD dllSize = SizeofResource(NULL, hRes);
-        const void *dllBytes = LockResource(hData);
-        if (dllBytes && dllSize > 0) {
-            WCHAR tempDir[MAX_PATH];
-            DWORD tempLen = GetTempPathW(MAX_PATH, tempDir);
-            if (tempLen > 0 && tempLen < MAX_PATH - 30) {
-                swprintf(g_extractedDllPath, MAX_PATH, L"%sWebView2Loader.dll", tempDir);
-                HANDLE hFile = CreateFileW(g_extractedDllPath, GENERIC_WRITE, 0, NULL,
-                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hFile != INVALID_HANDLE_VALUE) {
-                    DWORD written = 0;
-                    WriteFile(hFile, dllBytes, dllSize, &written, NULL);
-                    CloseHandle(hFile);
-                    if (written == dllSize) {
-                        HMODULE hMod = LoadLibraryW(g_extractedDllPath);
-                        if (hMod) {
-                            fnCreateEnvironment = (PFN_CreateCoreWebView2EnvironmentWithOptions)
-                                GetProcAddress(hMod, "CreateCoreWebView2EnvironmentWithOptions");
-                            if (fnCreateEnvironment) return TRUE;
-                        }
-                    }
-                }
-            }
-        }
+    if (!hRes) {
+        MessageBoxW(NULL, L"Failed to find WebView2Loader.dll in embedded resources.\n"
+            L"The executable may need to be rebuilt.", L"LockService", MB_ICONERROR);
+        return FALSE;
     }
-    return FALSE;
+    HGLOBAL hData = LoadResource(NULL, hRes);
+    DWORD dllSize = SizeofResource(NULL, hRes);
+    const void *dllBytes = LockResource(hData);
+    if (!dllBytes || dllSize == 0) {
+        MessageBoxW(NULL, L"Failed to load WebView2Loader.dll from embedded resources.",
+            L"LockService", MB_ICONERROR);
+        return FALSE;
+    }
+    WCHAR tempDir[MAX_PATH];
+    DWORD tempLen = GetTempPathW(MAX_PATH, tempDir);
+    if (tempLen == 0 || tempLen >= MAX_PATH - 50) {
+        MessageBoxW(NULL, L"Failed to get temp directory path.", L"LockService", MB_ICONERROR);
+        return FALSE;
+    }
+    // Use a LockService-specific subdirectory to avoid conflicts
+    swprintf(g_extractedDllPath, MAX_PATH, L"%sLockService", tempDir);
+    CreateDirectoryW(g_extractedDllPath, NULL);
+    swprintf(g_extractedDllPath, MAX_PATH, L"%sLockService\\WebView2Loader.dll", tempDir);
+
+    // Try to load existing copy first (may already be extracted from a previous run)
+    HMODULE hMod = LoadLibraryW(g_extractedDllPath);
+    if (!hMod) {
+        // Extract fresh copy
+        HANDLE hFile = CreateFileW(g_extractedDllPath, GENERIC_WRITE, 0, NULL,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            WCHAR msg[512];
+            swprintf(msg, 512, L"Failed to write WebView2Loader.dll to temp directory.\n\n"
+                L"Path: %s\nError: %lu", g_extractedDllPath, GetLastError());
+            MessageBoxW(NULL, msg, L"LockService", MB_ICONERROR);
+            return FALSE;
+        }
+        DWORD written = 0;
+        WriteFile(hFile, dllBytes, dllSize, &written, NULL);
+        CloseHandle(hFile);
+        if (written != dllSize) {
+            MessageBoxW(NULL, L"Failed to write complete WebView2Loader.dll to temp directory.",
+                L"LockService", MB_ICONERROR);
+            return FALSE;
+        }
+        hMod = LoadLibraryW(g_extractedDllPath);
+    }
+    if (!hMod) {
+        WCHAR msg[512];
+        swprintf(msg, 512, L"Failed to load WebView2Loader.dll.\n\n"
+            L"Path: %s\nError: %lu", g_extractedDllPath, GetLastError());
+        MessageBoxW(NULL, msg, L"LockService", MB_ICONERROR);
+        return FALSE;
+    }
+    fnCreateEnvironment = (PFN_CreateCoreWebView2EnvironmentWithOptions)
+        GetProcAddress(hMod, "CreateCoreWebView2EnvironmentWithOptions");
+    if (!fnCreateEnvironment) {
+        MessageBoxW(NULL, L"WebView2Loader.dll loaded but CreateCoreWebView2EnvironmentWithOptions not found.\n\n"
+            L"The DLL may be corrupted or the wrong version.", L"LockService", MB_ICONERROR);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 // ============================================================================
@@ -1821,10 +1855,6 @@ static void show_webview_config(void) {
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     if (!load_webview2_loader()) {
-        MessageBoxW(NULL,
-            L"WebView2Loader.dll not found.\n\n"
-            L"Please ensure WebView2Loader.dll is in the same directory as LockService.exe.",
-            L"LockService", MB_ICONERROR | MB_OK);
         CoUninitialize();
         return;
     }
