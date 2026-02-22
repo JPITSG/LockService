@@ -1,0 +1,11 @@
+#include <winuser.h>
+1 24 "LockService.manifest"
+
+#define IDI_APP_ICON 100
+IDI_APP_ICON ICON "assets/icon.ico"
+
+#define IDR_HTML_UI 200
+IDR_HTML_UI RCDATA "assets/dist/index.html"
+
+#define IDR_WEBVIEW2_DLL 201
+IDR_WEBVIEW2_DLL RCDATA "assets/WebView2Loader.dll"
