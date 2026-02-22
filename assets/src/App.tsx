@@ -111,9 +111,13 @@ export default function App() {
       reportHeight(Math.ceil(el.scrollHeight));
     };
 
+    const rafId = requestAnimationFrame(equalizeAndReport);
     const observer = new ResizeObserver(equalizeAndReport);
     observer.observe(el);
-    return () => observer.disconnect();
+    return () => {
+      cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
   }, []);
 
   const handleSave = () => {

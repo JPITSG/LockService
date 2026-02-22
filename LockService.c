@@ -1416,6 +1416,7 @@ static HWND g_hWnd = NULL;
 static ICoreWebView2Environment *g_webviewEnv = NULL;
 static ICoreWebView2Controller *g_webviewController = NULL;
 static ICoreWebView2 *g_webviewView = NULL;
+static BOOL g_webviewWindowShown = FALSE;
 
 // Dynamic loader for WebView2Loader.dll
 typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
@@ -1803,9 +1804,14 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             int chromeH = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
             int newWindowH = contentHeight + chromeH;
             int windowW = windowRect.right - windowRect.left;
-            // Keep the window centered horizontally on its current position
-            SetWindowPos(g_hWnd, NULL, 0, 0, windowW, newWindowH,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            UINT flags = SWP_NOMOVE | SWP_NOZORDER;
+            if (g_webviewWindowShown) {
+                flags |= SWP_NOACTIVATE;
+            } else {
+                flags |= SWP_SHOWWINDOW;
+            }
+            SetWindowPos(g_hWnd, NULL, 0, 0, windowW, newWindowH, flags);
+            g_webviewWindowShown = TRUE;
         }
     }
 
@@ -1828,6 +1834,7 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             return 0;
 
         case WM_CLOSE:
+            g_webviewWindowShown = FALSE;
             if (g_webviewController) {
                 g_webviewController->lpVtbl->Close(g_webviewController);
                 g_webviewController->lpVtbl->Release(g_webviewController);
@@ -1845,6 +1852,7 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             return 0;
 
         case WM_DESTROY:
+            g_webviewWindowShown = FALSE;
             PostQuitMessage(0);
             return 0;
     }
@@ -1888,9 +1896,7 @@ static void show_webview_config(void) {
         CoUninitialize();
         return;
     }
-
-    ShowWindow(g_hWnd, SW_SHOW);
-    UpdateWindow(g_hWnd);
+    g_webviewWindowShown = FALSE;
 
     // Build user data folder path in %TEMP%
     WCHAR userDataFolder[MAX_PATH];
@@ -1988,4 +1994,3 @@ int main(int argc, char* argv[]) {
     
     return 0;
 }
-
