@@ -160,4 +160,4 @@ make clean && make
 
 ## License
 
-MIT
+[MIT](LICENSE)
